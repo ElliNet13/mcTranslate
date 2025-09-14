@@ -12,6 +12,7 @@ const OUTPUT_JAR = "client.jar";
 const OUTPUT_DIR = "assets_extracted";
 const TARGET_FILE = "assets/minecraft/lang/en_us.json";
 const RESOURCE_DIR = "output_resource_pack";
+const RESUME_FILE = ".translation_resume.json";
 
 // CLI args
 const argv = yargs(hideBin(process.argv))
@@ -23,8 +24,19 @@ const argv = yargs(hideBin(process.argv))
     .option("transEngine", { type: "string", default: "google-api", describe: "Translation engine: google-api or translate-shell" })
     .option("extraTransArgs", { type: "string", default: "", describe: "Extra arguments to pass to trans when using translate-shell" })
     .option("engine", { type: "string", default: "google", describe: "Engine to pass to trans via -engine when using translate-shell" })
+    .option("resume", { type: "boolean", default: false, describe: "Resume from last saved progress" })
     .argv;
 
+let isExiting = false;
+process.on("SIGINT", () => {
+    console.log("\n⚠️ Ctrl+C detected, saving progress...");
+    isExiting = true;
+});
+
+// Helper sleep
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Fetch languages
 async function getLanguages(transEngine, engine) {
     if (transEngine === "translate-shell") {
         return new Promise((resolve, reject) => {
@@ -39,12 +51,14 @@ async function getLanguages(transEngine, engine) {
     }
 }
 
+// Cleanup output
 async function cleanup() {
     await fs.remove(OUTPUT_JAR);
     await fs.remove(OUTPUT_DIR);
     await fs.remove(RESOURCE_DIR);
 }
 
+// Download versions
 async function getVersions() {
     const res = await fetch(VERSION_MANIFEST);
     const manifest = await res.json();
@@ -80,10 +94,6 @@ async function extractLang(jarPath, outputDir = OUTPUT_DIR, target = TARGET_FILE
     }
 }
 
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 // Translate using translate-shell
 function transShellTranslate(text, toLang, engine, extraArgs) {
     return new Promise((resolve, reject) => {
@@ -95,6 +105,7 @@ function transShellTranslate(text, toLang, engine, extraArgs) {
     });
 }
 
+// Queue processing
 async function translateQueue(items, workerCount, translator, startDelay = 0, retryDelay = 10000) {
     if (!workerCount) return Promise.all(items.map((item, i) => translator(item, i)));
 
@@ -103,9 +114,9 @@ async function translateQueue(items, workerCount, translator, startDelay = 0, re
     async function worker(workerIndex) {
         if (startDelay) await sleep(workerIndex * startDelay);
 
-        while (index < items.length) {
+        while (index < items.length && !isExiting) {
             const i = index++;
-            while (true) {
+            while (!isExiting) {
                 try {
                     results[i] = await translator(items[i], i);
                     break;
@@ -119,12 +130,13 @@ async function translateQueue(items, workerCount, translator, startDelay = 0, re
     return results;
 }
 
-async function translateJsonConcurrent(obj, times, languages, threads, startDelay, retryDelay, transEngine, engine, extraArgs, pathPrefix = "") {
+// Recursive translation with resume support
+async function translateJsonConcurrent(obj, times, languages, threads, startDelay, retryDelay, transEngine, engine, extraArgs, pathPrefix = "", progress = {}) {
     if (Array.isArray(obj)) {
         return translateQueue(
             obj.map((v, i) => ({ value: v, path: `${pathPrefix}[${i}]` })),
             threads,
-            async ({ value, path }) => translateJsonConcurrent(value, times, languages, threads, startDelay, retryDelay, transEngine, engine, extraArgs, path)
+            async ({ value, path }) => translateJsonConcurrent(value, times, languages, threads, startDelay, retryDelay, transEngine, engine, extraArgs, path, progress)
         );
     } else if (obj && typeof obj === "object") {
         const keys = Object.keys(obj);
@@ -133,30 +145,47 @@ async function translateJsonConcurrent(obj, times, languages, threads, startDela
             threads,
             async ({ key, value, path }) => ({
                 key,
-                value: await translateJsonConcurrent(value, times, languages, threads, startDelay, retryDelay, transEngine, engine, extraArgs, path)
+                value: await translateJsonConcurrent(value, times, languages, threads, startDelay, retryDelay, transEngine, engine, extraArgs, path, progress)
             })
         );
         return translatedValues.reduce((acc, { key, value }) => { acc[key] = value; return acc; }, {});
     } else if (typeof obj === "string") {
+        const uniquePath = pathPrefix;
+        if (!progress[uniquePath]) progress[uniquePath] = 0;
         let text = obj;
-        for (let i = 0; i < times; i++) {
-            const lang = languages[Math.floor(Math.random() * languages.length)];
-            const attempt = async () => {
-                if (transEngine === "translate-shell") {
-                    text = await transShellTranslate(text, lang, engine, extraArgs);
-                } else {
-                    const res = await translate(text, { to: lang });
-                    text = res.text;
+
+        for (let i = progress[uniquePath]; i < times && !isExiting; i++) {
+            let lang = languages[Math.floor(Math.random() * languages.length)];
+            let attemptSucceeded = false;
+
+            while (!attemptSucceeded && !isExiting) {
+                try {
+                    if (transEngine === "translate-shell") {
+                        text = await transShellTranslate(text, lang, engine, extraArgs);
+                    } else {
+                        const res = await translate(text, { to: lang });
+                        text = res.text;
+                    }
+
+                    if (!text) throw new Error("Empty translation, retrying...");
+                    console.log(`🔹 [${uniquePath}] Pass ${i + 1} -> ${lang}: "${text}"`);
+                    attemptSucceeded = true;
+                } catch {
+                    await sleep(retryDelay);
+                    lang = languages[Math.floor(Math.random() * languages.length)]; // rechoose lang
                 }
-                console.log(`🔹 [${pathPrefix}] Pass ${i + 1} -> ${lang}: "${text}"`);
-            };
-            try {
-                await attempt();
-            } catch {
-                await sleep(retryDelay);
-                await attempt();
+            }
+
+            progress[uniquePath] = i + 1;
+
+            // Save progress
+            if (isExiting) {
+                await fs.writeJson(RESUME_FILE, { json: obj, progress, argv: argv }, { spaces: 4 });
+                process.exit();
             }
         }
+
+        // Translate back to English at the end
         try {
             if (transEngine === "translate-shell") {
                 text = await transShellTranslate(text, "en", engine, extraArgs);
@@ -164,24 +193,34 @@ async function translateJsonConcurrent(obj, times, languages, threads, startDela
                 const back = await translate(text, { to: "en" });
                 text = back.text;
             }
-            console.log(`🔸 [${pathPrefix}] Back to English: "${text}"`);
+            console.log(`🔸 [${uniquePath}] Back to English: "${text}"`);
         } catch {}
         return text;
     } else return obj;
 }
 
+// Main
 async function main() {
-    await cleanup();
+    let resumeData = null;
+    if (argv.resume && await fs.pathExists(RESUME_FILE)) {
+        resumeData = await fs.readJson(RESUME_FILE);
+        console.log("🔄 Resuming from last saved progress...");
+    }
+
+    if (!resumeData) {
+        await cleanup();
+    }
+
     const { versions, manifest } = await getVersions();
 
-    const version = argv.mcVersion || manifest.latest.release;
-    const repeatCount = argv.repeat;
-    const threads = argv.threads;
-    const startDelay = argv.startDelay || repeatCount * 50;
-    const retryDelay = argv.retryDelay;
-    const transEngine = argv.transEngine;
-    const extraArgs = argv.extraTransArgs;
-    const engine = argv.engine;
+    const version = resumeData?.argv?.mcVersion || argv.mcVersion || manifest.latest.release;
+    const repeatCount = resumeData?.argv?.repeat || argv.repeat;
+    const threads = resumeData?.argv?.threads || argv.threads;
+    const startDelay = resumeData?.argv?.startDelay || argv.startDelay || repeatCount * 50;
+    const retryDelay = resumeData?.argv?.retryDelay || argv.retryDelay;
+    const transEngine = resumeData?.argv?.transEngine || argv.transEngine;
+    const extraArgs = resumeData?.argv?.extraTransArgs || argv.extraTransArgs;
+    const engine = resumeData?.argv?.engine || argv.engine;
 
     if (!versions.find(v => v.id === version)) {
         console.log("❌ Invalid version ID.");
@@ -192,7 +231,7 @@ async function main() {
     const langPath = await extractLang(jarPath);
     if (!langPath) return;
 
-    const langJson = await fs.readJson(langPath);
+    let langJson = resumeData?.json || await fs.readJson(langPath);
     console.log(`📝 Lang file contains ${Object.keys(langJson).length} entries.`);
 
     await fs.ensureDir(RESOURCE_DIR);
@@ -209,12 +248,10 @@ async function main() {
     };
     await fs.writeJson(path.join(RESOURCE_DIR, "pack.mcmeta"), packMcmeta, { spaces: 4 });
 
-    console.log(`✅ Resource pack created at ${RESOURCE_DIR}`);
-
     const languages = await getLanguages(transEngine, engine);
     console.log(`🌐 Loaded ${languages.length} languages for translation.`);
 
-    console.log(`🔄 Starting translation with ${threads || "unlimited"} threads using ${transEngine}...`);
+    const progress = resumeData?.progress || {};
     const translatedJson = await translateJsonConcurrent(
         langJson,
         repeatCount,
@@ -224,9 +261,13 @@ async function main() {
         retryDelay,
         transEngine,
         engine,
-        extraArgs
+        extraArgs,
+        "",
+        progress
     );
+
     await fs.writeJson(langPath, translatedJson, { spaces: 4 });
+    if (await fs.pathExists(RESUME_FILE)) await fs.remove(RESUME_FILE);
 
     console.log(`✅ Translated file saved: ${langPath}`);
     console.log("🎉 All done!");
