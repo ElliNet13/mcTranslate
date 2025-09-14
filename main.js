@@ -2,8 +2,10 @@ import fetch from "node-fetch";
 import fs from "fs-extra";
 import path from "path";
 import AdmZip from "adm-zip";
-import promptSync from "prompt-sync";
+import { exec } from "child_process";
 import translate from "google-translate-api-x";
+import yargs from "yargs";
+import { hideBin } from "yargs/helpers";
 
 const VERSION_MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 const OUTPUT_JAR = "client.jar";
@@ -11,8 +13,30 @@ const OUTPUT_DIR = "assets_extracted";
 const TARGET_FILE = "assets/minecraft/lang/en_us.json";
 const RESOURCE_DIR = "output_resource_pack";
 
-async function getLanguages() {
-    return Object.keys(translate.languages);
+// CLI args
+const argv = yargs(hideBin(process.argv))
+    .option("mcVersion", { type: "string", describe: "Minecraft version" })
+    .option("repeat", { type: "number", default: 20, describe: "Number of translation passes" })
+    .option("threads", { type: "number", default: 10, describe: "Concurrent threads (0 = unlimited)" })
+    .option("startDelay", { type: "number", default: 0, describe: "Start delay per thread (ms)" })
+    .option("retryDelay", { type: "number", default: 10000, describe: "Retry delay for failed translations (ms)" })
+    .option("transEngine", { type: "string", default: "google-api", describe: "Translation engine: google-api or translate-shell" })
+    .option("extraTransArgs", { type: "string", default: "", describe: "Extra arguments to pass to trans when using translate-shell" })
+    .option("engine", { type: "string", default: "google", describe: "Engine to pass to trans via -engine when using translate-shell" })
+    .argv;
+
+async function getLanguages(transEngine, engine) {
+    if (transEngine === "translate-shell") {
+        return new Promise((resolve, reject) => {
+            exec(`trans -R ${engine} -list-codes`, (err, stdout) => {
+                if (err) return reject(err);
+                const langs = stdout.split("\n").map(l => l.trim()).filter(l => l);
+                resolve(langs);
+            });
+        });
+    } else {
+        return Object.keys(translate.languages);
+    }
 }
 
 async function cleanup() {
@@ -56,31 +80,36 @@ async function extractLang(jarPath, outputDir = OUTPUT_DIR, target = TARGET_FILE
     }
 }
 
-// Delay helper
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Concurrent translation queue with start delays and retry delays
+// Translate using translate-shell
+function transShellTranslate(text, toLang, engine, extraArgs) {
+    return new Promise((resolve, reject) => {
+        const cmd = `trans ${extraArgs} -engine ${engine} --brief :${toLang} "${text.replace(/"/g, '\\"')}"`;
+        exec(cmd, (err, stdout) => {
+            if (err) return reject(err);
+            resolve(stdout.trim());
+        });
+    });
+}
+
 async function translateQueue(items, workerCount, translator, startDelay = 0, retryDelay = 10000) {
-    if (!workerCount) {
-        // Unlimited concurrency
-        return Promise.all(items.map((item, i) => translator(item, i)));
-    }
+    if (!workerCount) return Promise.all(items.map((item, i) => translator(item, i)));
 
     let index = 0;
     const results = [];
     async function worker(workerIndex) {
-        if (startDelay) await sleep(workerIndex * startDelay); // stagger start
+        if (startDelay) await sleep(workerIndex * startDelay);
 
         while (index < items.length) {
             const i = index++;
             while (true) {
                 try {
                     results[i] = await translator(items[i], i);
-                    break; // success
-                } catch (err) {
-                    console.error(`⚠️ Translation failed at index ${i}, retrying in ${retryDelay / 1000}s...`);
+                    break;
+                } catch {
                     await sleep(retryDelay);
                 }
             }
@@ -90,12 +119,12 @@ async function translateQueue(items, workerCount, translator, startDelay = 0, re
     return results;
 }
 
-async function translateJsonConcurrent(obj, times = 1, languages = [], threads = 5, startDelay = 0, retryDelay = 10000, pathPrefix = "") {
+async function translateJsonConcurrent(obj, times, languages, threads, startDelay, retryDelay, transEngine, engine, extraArgs, pathPrefix = "") {
     if (Array.isArray(obj)) {
         return translateQueue(
             obj.map((v, i) => ({ value: v, path: `${pathPrefix}[${i}]` })),
             threads,
-            async ({ value, path }) => translateJsonConcurrent(value, times, languages, threads, startDelay, retryDelay, path)
+            async ({ value, path }) => translateJsonConcurrent(value, times, languages, threads, startDelay, retryDelay, transEngine, engine, extraArgs, path)
         );
     } else if (obj && typeof obj === "object") {
         const keys = Object.keys(obj);
@@ -104,7 +133,7 @@ async function translateJsonConcurrent(obj, times = 1, languages = [], threads =
             threads,
             async ({ key, value, path }) => ({
                 key,
-                value: await translateJsonConcurrent(value, times, languages, threads, startDelay, retryDelay, path)
+                value: await translateJsonConcurrent(value, times, languages, threads, startDelay, retryDelay, transEngine, engine, extraArgs, path)
             })
         );
         return translatedValues.reduce((acc, { key, value }) => { acc[key] = value; return acc; }, {});
@@ -113,38 +142,46 @@ async function translateJsonConcurrent(obj, times = 1, languages = [], threads =
         for (let i = 0; i < times; i++) {
             const lang = languages[Math.floor(Math.random() * languages.length)];
             const attempt = async () => {
-                const res = await translate(text, { to: lang });
-                console.log(`🔹 [${pathPrefix}] Pass ${i + 1} -> ${lang}: "${text}" => "${res.text}"`);
-                text = res.text;
+                if (transEngine === "translate-shell") {
+                    text = await transShellTranslate(text, lang, engine, extraArgs);
+                } else {
+                    const res = await translate(text, { to: lang });
+                    text = res.text;
+                }
+                console.log(`🔹 [${pathPrefix}] Pass ${i + 1} -> ${lang}: "${text}"`);
             };
             try {
                 await attempt();
-            } catch (err) {
-                console.error(`⚠️ Translation error at ${pathPrefix}, retrying in ${retryDelay / 1000}s...`);
+            } catch {
                 await sleep(retryDelay);
                 await attempt();
             }
         }
         try {
-            const back = await translate(text, { to: "en" });
-            console.log(`🔸 [${pathPrefix}] Back to English: "${text}" => "${back.text}"`);
-            text = back.text;
-        } catch (err) {
-            console.error(`⚠️ Back-to-English error at ${pathPrefix}:`, err.message);
-        }
+            if (transEngine === "translate-shell") {
+                text = await transShellTranslate(text, "en", engine, extraArgs);
+            } else {
+                const back = await translate(text, { to: "en" });
+                text = back.text;
+            }
+            console.log(`🔸 [${pathPrefix}] Back to English: "${text}"`);
+        } catch {}
         return text;
-    } else {
-        return obj;
-    }
+    } else return obj;
 }
 
 async function main() {
     await cleanup();
     const { versions, manifest } = await getVersions();
-    const prompt = promptSync();
 
-    const version = process.argv[2] || prompt("Enter Minecraft version (leave blank for latest release): ").trim() || manifest.latest.release;
-    const repeatCount = parseInt(process.argv[3] || prompt("Enter number of translation passes: ").trim() || "3");
+    const version = argv.mcVersion || manifest.latest.release;
+    const repeatCount = argv.repeat;
+    const threads = argv.threads;
+    const startDelay = argv.startDelay || repeatCount * 50;
+    const retryDelay = argv.retryDelay;
+    const transEngine = argv.transEngine;
+    const extraArgs = argv.extraTransArgs;
+    const engine = argv.engine;
 
     if (!versions.find(v => v.id === version)) {
         console.log("❌ Invalid version ID.");
@@ -156,23 +193,8 @@ async function main() {
     if (!langPath) return;
 
     const langJson = await fs.readJson(langPath);
-    const totalEntries = Object.keys(langJson).length;
-    console.log(`📝 Lang file contains ${totalEntries} entries.`);
+    console.log(`📝 Lang file contains ${Object.keys(langJson).length} entries.`);
 
-    // Threads
-    let threadsInput = process.argv[4] || prompt(`Enter number of concurrent threads (blank = unlimited, default = default): `).trim();
-    const threads = threadsInput.toLowerCase() === "default" || threadsInput === "" ? 0 : parseInt(threadsInput);
-
-    // Start delay
-    let startDelayInput = process.argv[5] || prompt(`Enter start delay per thread in ms (blank = default based on repeatCount, default = default): `).trim();
-    const defaultStartDelay = repeatCount * 50; // default 50ms per translation
-    const startDelay = startDelayInput.toLowerCase() === "default" || startDelayInput === "" ? defaultStartDelay : parseInt(startDelayInput);
-
-    // Retry delay
-    let retryDelayInput = process.argv[6] || prompt(`Enter retry delay in ms (blank = 10000ms, default = default): `).trim();
-    const retryDelay = retryDelayInput.toLowerCase() === "default" || retryDelayInput === "" ? 10000 : parseInt(retryDelayInput);
-
-    // Create resource pack
     await fs.ensureDir(RESOURCE_DIR);
     const extractedAssetsDir = path.join(OUTPUT_DIR, "assets");
     if (await fs.pathExists(extractedAssetsDir)) {
@@ -182,21 +204,32 @@ async function main() {
     const packMcmeta = {
         pack: {
             pack_format: versionInfo.assetIndex?.id || "1",
-            description: `Google Translated Minecraft ${version}`,
+            description: `Translated Minecraft ${version}`,
         }
     };
     await fs.writeJson(path.join(RESOURCE_DIR, "pack.mcmeta"), packMcmeta, { spaces: 4 });
 
     console.log(`✅ Resource pack created at ${RESOURCE_DIR}`);
-    console.log(`🔄 Starting concurrent Google translation with ${threads || "unlimited"} threads...`);
 
-    const languages = await getLanguages();
-    const translatedJson = await translateJsonConcurrent(langJson, repeatCount, languages, threads, startDelay, retryDelay);
+    const languages = await getLanguages(transEngine, engine);
+    console.log(`🌐 Loaded ${languages.length} languages for translation.`);
+
+    console.log(`🔄 Starting translation with ${threads || "unlimited"} threads using ${transEngine}...`);
+    const translatedJson = await translateJsonConcurrent(
+        langJson,
+        repeatCount,
+        languages,
+        threads,
+        startDelay,
+        retryDelay,
+        transEngine,
+        engine,
+        extraArgs
+    );
     await fs.writeJson(langPath, translatedJson, { spaces: 4 });
 
     console.log(`✅ Translated file saved: ${langPath}`);
     console.log("🎉 All done!");
-    console.log("You can now put the output_resource_pack folder into your Minecraft resourcepacks folder and enable it in-game.");
 }
 
 main().catch(err => console.error(err));

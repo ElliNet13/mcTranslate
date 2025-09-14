@@ -12,3 +12,5 @@ How is this better or worse then a mod like [Translater](https://www.curseforge.
 So yeah it's ment for **vanilla** Minecraft, **not** modded.
 
 If you put it in modded Minecraft only vanilla text will be translated.
+
+Can do much more with translate-shell, see node main.js --help for args
